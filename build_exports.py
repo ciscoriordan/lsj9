@@ -171,7 +171,142 @@ def build_headword_pos():
     return pos_map
 
 
-def build_short_defs():
+def _parse_xref_targets(text, hw_set):
+    """Extract cross-reference target headword(s) from a gloss text.
+
+    Handles patterns like:
+      "v. βαλλ-αντίδιον"       -> ["βαλλαντίδιον"]
+      "v. sub ἁνδάνω"          -> ["ἁνδάνω"]
+      "= ἀβακέω, Anacr.74"     -> ["ἀβακέω"]
+      "v. ἀεσι-φροσύνη, ἀεσίφρων" -> ["ἀεσιφροσύνη", "ἀεσίφρων"]
+
+    Returns a list of target headwords that exist in hw_set, or empty list.
+    """
+    _GK_RE = re.compile(r"[\u0370-\u03FF\u1F00-\u1FFF]")
+
+    # Match "v. sub X", "v. X", or "= X" at the start
+    m = re.match(r"^(?:v\.\s+sub\s+|v\.\s+|=\s+)", text)
+    if not m:
+        return []
+
+    rest = text[m.end():]
+
+    # Split on commas and semicolons to get candidate tokens
+    # But stop at citation patterns (uppercase Latin, numbers, abbreviations)
+    candidates = []
+    for chunk in re.split(r"[;]", rest):
+        for part in chunk.split(","):
+            part = part.strip()
+            # Extract Greek tokens from this part
+            tokens = part.split()
+            for tok in tokens:
+                tok = tok.strip(".,;:() ")
+                if not tok:
+                    continue
+                # Skip sense numbers like "II", "III", "I.1b"
+                if re.match(r"^[IViv]+\.?$", tok) or re.match(r"^[0-9]", tok):
+                    continue
+                # Skip "sub", "sq.", "q.v.", Latin citation words
+                if tok.lower() in ("sub", "sq.", "q.v.", "foreg.", "supr.",
+                                    "infr.", "l.c."):
+                    continue
+                # Must contain Greek characters to be a headword ref
+                if _GK_RE.search(tok):
+                    # Remove editorial hyphens
+                    clean = _strip_length_marks(tok.replace("-", "").replace(" ", ""))
+                    if clean in hw_set:
+                        candidates.append(clean)
+                    # Also try without trailing sense markers
+                    clean2 = re.sub(r"[IViv0-9]+$", "", clean)
+                    if clean2 and clean2 != clean and clean2 in hw_set:
+                        candidates.append(clean2)
+                else:
+                    # Non-Greek token - stop scanning this chunk
+                    break
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def build_crossrefs(hw_set):
+    """Build lsj9_crossrefs.json - cross-reference resolution map.
+
+    Parses "v. X" and "= X" patterns from glosses to find headwords that
+    are pure cross-references (their only content points to another entry).
+    Resolves chains (A -> B -> C becomes A -> C).
+
+    Output: {headword: [target_headword, ...]}
+    """
+    print("Building crossrefs...", end=" ", flush=True)
+
+    # Collect first gloss per headword
+    first_glosses = {}
+    with open(GLOSSES_PATH, encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            hw = _strip_length_marks(obj["headword"])
+            if hw not in first_glosses:
+                first_glosses[hw] = obj["text"]
+
+    # Parse cross-references from entries with short xref-only text
+    raw_xrefs = {}
+    for hw, text in first_glosses.items():
+        # Only treat as xref if the text is short (pure cross-reference)
+        if len(text) > 120:
+            continue
+        targets = _parse_xref_targets(text, hw_set)
+        # Don't include self-references
+        targets = [t for t in targets if t != hw]
+        if targets:
+            raw_xrefs[hw] = targets
+
+    # Resolve chains: if A -> B and B -> C, then A -> C
+    # Limit depth to avoid cycles
+    resolved = {}
+    for hw, targets in raw_xrefs.items():
+        final_targets = []
+        for t in targets:
+            visited = {hw}
+            current = t
+            depth = 0
+            while current in raw_xrefs and depth < 5:
+                if current in visited:
+                    break  # cycle detected
+                visited.add(current)
+                # Follow first target in the chain
+                current = raw_xrefs[current][0]
+                depth += 1
+            final_targets.append(current)
+        # Deduplicate and remove self-references
+        seen = set()
+        deduped = []
+        for t in final_targets:
+            if t not in seen and t != hw:
+                seen.add(t)
+                deduped.append(t)
+        if deduped:
+            resolved[hw] = deduped
+
+    out_path = SCRIPT_DIR / "lsj9_crossrefs.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(resolved, f, ensure_ascii=False, indent=1)
+
+    size_kb = out_path.stat().st_size / 1024
+    # Count how many resolve to a single target
+    single = sum(1 for v in resolved.values() if len(v) == 1)
+    multi = len(resolved) - single
+    print(f"{len(resolved):,} cross-refs ({single:,} single, {multi:,} multi) "
+          f"({size_kb:.0f} KB)")
+    return resolved
+
+
+def build_short_defs(crossrefs=None):
     """Build lsj9_short_defs.json - clean English short definitions per headword.
 
     Extracts from lsj9_glosses.jsonl. For each headword, takes the first
@@ -181,6 +316,10 @@ def build_short_defs():
     - Citation references (author names, work abbreviations)
     - Parenthetical notes
     - Trailing punctuation
+
+    If crossrefs is provided, headwords with no direct definition but a
+    cross-reference target that has one will get the target's definition
+    with a "(see X)" note appended.
 
     Output: {headword: "short definition string"}
     """
@@ -251,12 +390,27 @@ def build_short_defs():
                     text = text[:200].rsplit(" ", 1)[0]
                 short_defs[hw] = text
 
+    # Resolve cross-references: fill in missing definitions from targets
+    xref_filled = 0
+    if crossrefs:
+        for hw, targets in crossrefs.items():
+            if hw in short_defs:
+                continue
+            # Try each target until we find one with a definition
+            for target in targets:
+                if target in short_defs:
+                    short_defs[hw] = f"{short_defs[target]} (see {target})"
+                    xref_filled += 1
+                    break
+
     out_path = SCRIPT_DIR / "lsj9_short_defs.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(short_defs, f, ensure_ascii=False, indent=1)
 
     size_kb = out_path.stat().st_size / 1024
     print(f"{len(short_defs):,} definitions ({size_kb:.0f} KB)")
+    if xref_filled:
+        print(f"  including {xref_filled:,} resolved from cross-references")
     return short_defs
 
 
@@ -313,9 +467,11 @@ def main():
         print("Run lsjpre export_lsj9.py first to generate raw data files.")
         return
 
-    build_headwords_flat()
+    headwords = build_headwords_flat()
     build_headword_pos()
-    build_short_defs()
+    hw_set = set(headwords)
+    crossrefs = build_crossrefs(hw_set)
+    build_short_defs(crossrefs)
     build_glosses_flat()
 
     print("\nDone.")

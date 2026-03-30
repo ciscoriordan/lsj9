@@ -57,7 +57,8 @@ These derived files are built from the raw data by `build_exports.py`. They prov
 |------|-------------|-----------|
 | `lsj9_headwords_flat.json` | 118,764 headword strings (deduplicated, length-marks stripped) | dilemma (headword-set filtering) |
 | `lsj9_headword_pos.json` | 135,174 headword-to-UPOS mappings (NOUN, ADJ, VERB, ADV, ADP, etc.) | dilemma (POS disambiguation) |
-| `lsj9_short_defs.json` | 109,487 clean English short definitions per headword | dilemma |
+| `lsj9_crossrefs.json` | 5,029 cross-reference mappings (headword to target headwords) | LSJ10 Kindle edition |
+| `lsj9_short_defs.json` | 113,229 clean English short definitions per headword (includes 3,742 resolved cross-references) | dilemma |
 | `lsj9_glosses_flat.json` | 113,247 headwords with 170,528 flattened English glosses | dilemma |
 
 To rebuild after updating raw data:
@@ -88,9 +89,25 @@ Sources: grammar field (ὁ/ἡ/τό -> NOUN, ον/ές -> ADJ), verb-ending heu
 ```json
 {
   "ἀγαθός": "good",
-  "ἄγω": "lead, carry, bring"
+  "ἄγω": "lead, carry, bring",
+  "ἀδράφαξυς": "orach, Atriplex rosea (see ἀτράφαξυς)"
 }
 ```
+
+Entries that are pure cross-references ("v. X", "= X") with no direct English definition get the target's definition with a `(see X)` note, resolved via `lsj9_crossrefs.json`.
+
+### Cross-References Format
+
+`lsj9_crossrefs.json` maps headwords that are cross-references to their resolved target headword(s). Chains (A -> B -> C) are resolved so A points directly to C.
+
+```json
+{
+  "ἀδικήω": ["ἀδικέω"],
+  "ἀασιφροσύνη": ["ἀεσιφροσύνη", "ἀεσίφρων"]
+}
+```
+
+Parsed from "v. X", "v. sub X", and "= X" patterns in gloss text. Editorial hyphens in targets (e.g. "ἀεσι-φροσύνη") are removed to match headword forms. Only targets that exist in the headword list are included.
 
 ## How This Differs from Other Digital LSJ Projects
 
